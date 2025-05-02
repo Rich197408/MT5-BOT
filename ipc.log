@@ -1,0 +1,4 @@
+initialize() -> True (1, 'Success')
+login()      -> True (1, 'Success')
+symbol_select('EURUSD') -> True (1, 'Success')
+symbol_select('XAUUSD') -> True (1, 'Success')

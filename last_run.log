@@ -1,0 +1,13 @@
+C:\Users\Administrator\Downloads\mt5-bot\live_bot.py:44: FutureWarning: 'H' is deprecated and will be removed in a future version, please use 'h' instead.
+  df4  = fetch_mt5_ohlcv(symbol, "4h",    500).resample("1H").ffill().add_suffix("_4h")
+C:\Users\Administrator\Downloads\mt5-bot\live_bot.py:45: FutureWarning: 'H' is deprecated and will be removed in a future version, please use 'h' instead.
+  df30 = fetch_mt5_ohlcv(symbol, "30m",  4000).resample("1H").last().ffill().add_suffix("_30m")
+C:\Users\Administrator\Downloads\mt5-bot\venv\Lib\site-packages\ta\trend.py:1030: FutureWarning: Series.__setitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To set a value by position, use `ser.iloc[pos] = value`
+  self._psar[i] = high2
+C:\Users\Administrator\Downloads\mt5-bot\venv\Lib\site-packages\ta\trend.py:1030: FutureWarning: Series.__setitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To set a value by position, use `ser.iloc[pos] = value`
+  self._psar[i] = high2
+C:\Users\Administrator\Downloads\mt5-bot\venv\Lib\site-packages\ta\trend.py:1030: FutureWarning: Series.__setitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To set a value by position, use `ser.iloc[pos] = value`
+  self._psar[i] = high2
+MT5 attached & logged in
+2025-04-30 16:00:00+00:00 -> NEUTRAL @ 0.0% (combined)
+No consensus—skipping trade.
