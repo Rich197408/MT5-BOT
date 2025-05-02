@@ -145,3 +145,4 @@ if __name__ == "__main__":
         while True:
             main_once()
             time.sleep(3600)
+# módosítás teszt miatt
