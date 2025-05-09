@@ -60,3 +60,4 @@ rets = test['close'].pct_change().shift(-1).iloc[:-1]
 strategy = (preds[:-1] * rets).add(1).cumprod() - 1
 bh = rets.add(1).cumprod() - 1
 print(f"Strategy return: {strategy.iloc[-1]:.2%}, Buy&Hold: {bh.iloc[-1]:.2%}")
+# GitHub teszt commit

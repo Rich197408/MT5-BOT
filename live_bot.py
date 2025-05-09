@@ -1,148 +1,179 @@
 ﻿#!/usr/bin/env python3
-import argparse
-import sys
-import time
-import datetime
+import argparse, sys, time, datetime, math
 
-import joblib
-import pandas as pd
 import MetaTrader5 as mt5
+import pandas as pd
 
 from fetch_eurusd_attach import fetch_mt5_ohlcv
-from ta.utils import dropna
-from ta import add_all_ta_features
-
 from strategies import SMCStrategy, ICTStrategy, SwingStrategy, SignalEngine
 
-# ─── CONFIG ────────────────────────────────────────────────
-MODEL_PATH   = "multi_tf_rf.pkl"
-SYMBOL       = "XAUUSD"
-MAGIC        = 123456
-LOGIN        = 92214559
-PASSWORD     = "E_HrX6Wp"
-SERVER       = "MetaQuotes-Demo"
+# ─── CONFIG ────────────────────────────────────────────────────────────────
+SYMBOL            = "XAUUSD"
+LOGIN             = 92214559
+PASSWORD          = "E_HrX6Wp"
+SERVER            = "MetaQuotes-Demo"
+MAGIC             = 123456
 
-# Multi-strategy setup
+# Risk settings
+RISK_PER_TRADE    = 0.01    # 1% of account balance per trade
+SL_POINTS         = 500.0   # 500 points × 0.01 = $5 stop-loss
+RR                = 2       # take-profit = SL × RR
+TRAIL_TRIGGER     = 250.0   # 250 points × 0.01 = $2.50 to trail SL
+
+# Daily P/L caps (closed trades only; reset at 00:00 UTC)
+DAILY_PROFIT_TARGET = 300.0
+DAILY_LOSS_LIMIT    = -800.0
+
+# Strategy ensemble
 STRATEGIES = [
     SMCStrategy(SYMBOL),
     ICTStrategy(SYMBOL),
     SwingStrategy(SYMBOL),
 ]
-WEIGHTS    = [0.33, 0.33, 0.34]
+WEIGHTS  = [0.4, 0.3, 0.3]
+THRESHOLD = 0.6   # require ≥60% aggregate confidence
+engine    = SignalEngine(STRATEGIES, WEIGHTS, threshold=THRESHOLD)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Raise these for maximum selectivity
-THRESHOLD  = 0.8   # require at least 80% weighted agreement among strategies
-CUTOFF     = 0.9   # require at least 90% ML model confidence
+def initialize_mt5():
+    if not mt5.initialize():
+        print("ERROR: MT5 initialize() failed:", mt5.last_error())
+        sys.exit(1)
+    if not mt5.login(LOGIN, password=PASSWORD, server=SERVER):
+        print("ERROR: MT5 login failed:", mt5.last_error())
+        mt5.shutdown()
+        sys.exit(1)
 
-engine = SignalEngine(STRATEGIES, WEIGHTS, threshold=THRESHOLD)
+def get_closed_pl_since(start_dt: datetime.datetime) -> float:
+    deals = mt5.history_deals_get(start_dt, datetime.datetime.utcnow())
+    return sum(d.profit for d in deals) if deals else 0.0
 
-def is_market_open() -> bool:
-    """Return True if today is Mon-Fri UTC."""
-    return datetime.datetime.utcnow().weekday() < 5
+def build_multi_tf_features(symbol: str) -> pd.DataFrame:
+    df1h = fetch_mt5_ohlcv(symbol, "1h",   2000)[["open","high","low","close"]].add_suffix("_1h")
+    df4h = fetch_mt5_ohlcv(symbol, "4h",    500)[["open","high","low","close"]].add_suffix("_4h").resample("1h").ffill()
+    df30 = fetch_mt5_ohlcv(symbol, "30m",  4000)[["open","high","low","close"]].add_suffix("_30m").resample("1h").last().ffill()
+    df15 = fetch_mt5_ohlcv(symbol, "15m",  8000)[["open","high","low","close"]].add_suffix("_15m").resample("1h").last().ffill()
+    return df1h.join([df4h, df30, df15], how="inner").dropna()
 
-def build_multi_tf_features(symbol=SYMBOL) -> pd.DataFrame:
-    df1  = fetch_mt5_ohlcv(symbol, "1h",   2000)
-    df4  = fetch_mt5_ohlcv(symbol, "4h",    500).resample("1H").ffill().add_suffix("_4h")
-    df30 = fetch_mt5_ohlcv(symbol, "30m",  4000).resample("1H").last().ffill().add_suffix("_30m")
-    df   = df1.join([df4, df30], how="inner").dropna()
-
-    def k(o, h, l, c, v):
-        return dict(open=o, high=h, low=l, close=c, volume=v, fillna=True)
-
-    f1  = add_all_ta_features(dropna(df), **k("open","high","low","close","tick_volume")).add_suffix("_1h")
-    f4  = add_all_ta_features(dropna(df), **k("open_4h","high_4h","low_4h","close_4h","tick_volume_4h")).add_suffix("_4h")
-    f30 = add_all_ta_features(dropna(df), **k("open_30m","high_30m","low_30m","close_30m","tick_volume_30m")).add_suffix("_30m")
-
-    return f1.join([f4, f30], how="inner").dropna()
-
-def execute_trade(signal: str, confidence: float) -> None:
-    time.sleep(1)
-
-    if not mt5.symbol_select(SYMBOL, True):
-        print("ERROR: symbol_select failed:", mt5.last_error())
-        return
-
-    info = mt5.symbol_info(SYMBOL)
-    if not info:
-        print(f"ERROR: '{SYMBOL}' not in Market Watch.")
-        return
-
-    if mt5.positions_get(symbol=SYMBOL):
-        print("Position already open—skipping.")
-        return
-
+def execute_trade(signal: str, conf: float):
     tick = mt5.symbol_info_tick(SYMBOL)
-    if not tick:
-        print(f"ERROR: no tick for {SYMBOL}")
-        return
+    info = mt5.symbol_info(SYMBOL)
+    point = info.point
+    contract_size = info.trade_contract_size
 
-    lot   = 1.0 if confidence >= 0.85 else 0.5
-    price = tick.ask if signal == "BUY" else tick.bid
-    pt    = info.point
-    sl    = price - 25 * pt if signal == "BUY" else price + 25 * pt
-    tp    = price + 50 * pt if signal == "BUY" else price - 50 * pt
+    price = tick.ask if signal=="BUY" else tick.bid
+    sl_price = price - SL_POINTS*point if signal=="BUY" else price + SL_POINTS*point
+    tp_price = price + SL_POINTS*RR*point if signal=="BUY" else price - SL_POINTS*RR*point
+
+    # enforce broker's minimum stop distance
+    min_dist = info.trade_stops_level * point
+    if abs(price - sl_price) < min_dist:
+        sl_price = price - min_dist if signal=="BUY" else price + min_dist
+
+    # position sizing: risk 1% of balance
+    sl_dist      = abs(price - sl_price)
+    risk_per_lot = sl_dist * contract_size
+    balance      = mt5.account_info().balance
+    raw_lots     = (balance * RISK_PER_TRADE) / risk_per_lot
+    step         = info.volume_step
+    vol          = max(info.volume_min, min(info.volume_max,
+                      math.floor(raw_lots/step)*step))
 
     req = {
-        "action":    mt5.TRADE_ACTION_DEAL,
-        "symbol":    SYMBOL,
-        "volume":    lot,
-        "type":      mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL,
-        "price":     price,
-        "sl":        sl,
-        "tp":        tp,
-        "deviation": 10,
-        "magic":     MAGIC,
-        "comment":   "mlbot"
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       SYMBOL,
+        "volume":       vol,
+        "type":         mt5.ORDER_TYPE_BUY if signal=="BUY" else mt5.ORDER_TYPE_SELL,
+        "price":        price,
+        "sl":           round(sl_price, info.digits),
+        "tp":           round(tp_price, info.digits),    # <-- ensure TP always set
+        "deviation":    10,
+        "magic":        MAGIC,
+        "comment":      "MCBot",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
     }
     res = mt5.order_send(req)
-    if res.retcode != mt5.TRADE_RETCODE_DONE:
-        print("Order failed:", res)
+    if res.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"{signal} @ {price:.2f} Vol={vol:.2f} SL={sl_price:.2f} TP={tp_price:.2f}")
     else:
-        print(f"Order #{res.order} placed: {signal} {lot}@{price:.2f} SL={sl:.2f} TP={tp:.2f}")
+        print("Order failed:", res.comment)
 
-def main_once(force: bool = False) -> None:
-    if not force and not is_market_open():
-        print("Market closed—skipping.")
-        return
+def trail_sl_to_breakeven():
+    for pos in mt5.positions_get(symbol=SYMBOL) or []:
+        tick = mt5.symbol_info_tick(SYMBOL)
+        info = mt5.symbol_info(SYMBOL)
+        point = info.point
+        entry = pos.price_open
 
-    if not mt5.initialize():
-        print("ERROR: could not attach to MT5:", mt5.last_error())
-        return
-    if not mt5.login(LOGIN, PASSWORD, SERVER):
-        print("ERROR: login failed:", mt5.last_error())
+        if pos.type == mt5.ORDER_TYPE_BUY and (tick.bid - entry) >= TRAIL_TRIGGER*point:
+            # move SL to breakeven but keep the original TP
+            mt5.order_send({
+                "action":    mt5.TRADE_ACTION_SLTP,
+                "position":  pos.ticket,
+                "sl":        round(entry, info.digits),
+                "tp":        round(pos.tp, info.digits),    # <-- carry forward TP
+            })
+        elif pos.type == mt5.ORDER_TYPE_SELL and (entry - tick.ask) >= TRAIL_TRIGGER*point:
+            mt5.order_send({
+                "action":    mt5.TRADE_ACTION_SLTP,
+                "position":  pos.ticket,
+                "sl":        round(entry, info.digits),
+                "tp":        round(pos.tp, info.digits),    # <-- carry forward TP
+            })
+
+def main_loop(force_weekend: bool, test_trade: bool, run_once: bool):
+    initialize_mt5()
+    print("MT5 connected.")
+    now = datetime.datetime.utcnow()
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if test_trade:
+        execute_trade("BUY", 1.0)
         mt5.shutdown()
         return
 
-    print("MT5 attached & logged in")
-    time.sleep(1)
+    while True:
+        now = datetime.datetime.utcnow()
+        if now.date() != sod.date():
+            sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            print("New UTC day, reset P/L counter.")
 
-    df_feat = build_multi_tf_features()
+        closed_pl = get_closed_pl_since(sod)
+        print(f"Closed P/L since {sod:%Y-%m-%d}: {closed_pl:.2f}")
 
-    # per‐strategy and aggregate
-    ts = df_feat.index[-1]
-    signal, conf = engine.aggregate(df_feat)
-    print(f"{ts} -> {signal} @ {conf:.0%} combined")
+        if closed_pl >= DAILY_PROFIT_TARGET:
+            print("Daily profit target reached. Pausing new trades.")
+        elif closed_pl <= DAILY_LOSS_LIMIT:
+            print("Daily loss limit hit. Pausing new trades.")
+        else:
+            df_feat = build_multi_tf_features(SYMBOL)
+            sig, conf = engine.aggregate(df_feat)
+            print(f"{now:%Y-%m-%d %H:%M} → {sig} @ {conf:.2f}")
+            if sig in ("BUY","SELL") and conf>=THRESHOLD:
+                execute_trade(sig, conf)
+            trail_sl_to_breakeven()
 
-    # only fire on very strong consensus **and** high model confidence
-    if signal in ("BUY", "SELL") and conf >= CUTOFF:
-        execute_trade(signal, conf)
-    else:
-        print(f"Skipping trade: need signal in BUY/SELL with conf ≥{CUTOFF:.0%}")
+        if run_once:
+            print("Exiting after one cycle (--once).")
+            break
+
+        # weekend skip
+        if now.weekday()>=5 and not force_weekend:
+            time.sleep(3600)
+            continue
+
+        time.sleep(900)  # 15-minute cycle
 
     mt5.shutdown()
-    print("MT5 shutdown.")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--once",  action="store_true")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+if __name__=="__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--once",       action="store_true",  help="single cycle then exit")
+    p.add_argument("--force",      action="store_true",  help="ignore weekend check")
+    p.add_argument("--test-trade", action="store_true",  help="place one test trade")
+    args = p.parse_args()
 
-    if args.once:
-        main_once(force=args.force)
-        sys.exit(0)
-    else:
-        while True:
-            main_once()
-            time.sleep(3600)
-# módosítás teszt miatt
+    main_loop(force_weekend=args.force,
+              test_trade=args.test_trade,
+              run_once=args.once)
